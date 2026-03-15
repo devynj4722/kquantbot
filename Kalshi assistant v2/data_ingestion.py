@@ -12,6 +12,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 import trade_logger
+import ssl
+import certifi
 
 
 class DataIngestion:
@@ -32,6 +34,9 @@ class DataIngestion:
         if KALSHI_PRIVATE_KEY:
             self.kalshi_private_key = load_pem_private_key(
                 KALSHI_PRIVATE_KEY.encode('utf-8'), password=None)
+        
+        # Create SSL context for Mac/System certificate issues
+        self.ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     # ── Coinbase candle seed ──────────────────────────────────────────────────
     def _seed_candles_from_rest(self):
@@ -191,8 +196,10 @@ class DataIngestion:
 
     # ── Coinbase WebSocket ────────────────────────────────────────────────────
     async def connect_coinbase(self):
+        self.ui_display.log_info("Connecting to Coinbase WS...")
         try:
-            async with websockets.connect(COINBASE_WS_URL) as ws:
+            async with websockets.connect(COINBASE_WS_URL, ssl=self.ssl_context) as ws:
+                self.ui_display.log_info("Coinbase WS Connected.")
                 await ws.send(json.dumps({
                     "type": "subscribe",
                     "product_ids": [COINBASE_PRODUCT_ID],
@@ -235,18 +242,26 @@ class DataIngestion:
 
     # ── Kalshi WebSocket ──────────────────────────────────────────────────────
     async def connect_kalshi(self):
+        if not KALSHI_API_KEY:
+            self.ui_display.log_error("CRITICAL: KALSHI_API_KEY missing in .env")
+            return
+
         while True:
+            self.ui_display.log_info("Checking for active Kalshi markets...")
             ticker, close_ts = self._get_active_15m_ticker()
             if not ticker:
+                self.ui_display.log_error("No active Kalshi markets. Retrying in 30s...")
                 await asyncio.sleep(30)
                 continue
 
             self.current_ticker = ticker
             self.market_close_ts = close_ts
 
+            self.ui_display.log_info(f"Connecting to Kalshi WS for {ticker}...")
             try:
                 headers = self._make_kalshi_headers()
-                async with websockets.connect(KALSHI_WS_URL, additional_headers=headers) as ws:
+                async with websockets.connect(KALSHI_WS_URL, additional_headers=headers, ssl=self.ssl_context) as ws:
+                    self.ui_display.log_info(f"Kalshi WS Connected ({ticker})")
                     if ws.response.status_code in (401, 403):
                         self.ui_display.log_error(
                             "AUTH FAILED (401/403) — Kalshi API key may be expired. Check .env.")
@@ -287,6 +302,7 @@ class DataIngestion:
             await asyncio.sleep(2)
 
     async def start(self):
+        self.ui_display.log_info("Starting Data Ingestion Pipeline...")
         # Seed historical candles before entering live loop
         self._seed_candles_from_rest()
         await asyncio.gather(

@@ -6,7 +6,7 @@ cryptography
 python-dotenv
 websockets
 aiohttp
-
+certifi
 # GUI (High-Performance GPU Accelerated)
 dearpygui
 Pillow
