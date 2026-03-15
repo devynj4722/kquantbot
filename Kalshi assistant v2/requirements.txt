@@ -1,0 +1,13 @@
+# Core Dependencies
+requests
+pandas
+numpy
+cryptography
+python-dotenv
+websockets
+aiohttp
+
+# GUI (High-Performance GPU Accelerated)
+dearpygui
+Pillow
+pystray
