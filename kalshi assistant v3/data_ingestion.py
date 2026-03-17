@@ -31,6 +31,8 @@ class DataIngestion:
         self._last_signal_time = 0        # For internal message tracking (Socket health)
         self._last_push_time = 0          # For signal throttling
         self.best_no_ask = 0.5
+        self.strike_price = 0.0           # Added initialization
+        self.market_close_ts = 0.0        # Added initialization
         self._no_ask_history = deque(maxlen=5)   # for implied prob trend
         self._open_positions = 0          # guard: don't over-trade
         self._last_trade_ticker = None    # fire once per 15m window
@@ -165,17 +167,20 @@ class DataIngestion:
             self.current_btc_price, p_win_estimate=p_win,
             pot_profit=pot_profit, pot_loss=pot_loss)
         signals['prob_trend'] = self._get_prob_trend()
-        signals['time_left'] = max(0, int((self.market_close_ts or 0) - time.time()))
+        # Defensive check for market close time
+        m_close = getattr(self, 'market_close_ts', 0)
+        signals['time_left'] = max(0, int((m_close or 0) - time.time()))
         signals['p_win_estimate'] = p_win
 
         # ATR Distance: how many ATRs is BTC from the strike?
         atr = signals.get('atr', 0.0)
-        if atr > 0 and self.strike_price > 0:
-            atr_distance = (self.current_btc_price - self.strike_price) / atr
+        strike = getattr(self, 'strike_price', 0.0)
+        if atr > 0 and strike > 0:
+            atr_distance = (self.current_btc_price - strike) / atr
         else:
             atr_distance = 0.0
         signals['atr_distance'] = atr_distance
-        signals['strike_price'] = self.strike_price
+        signals['strike_price'] = strike
         signals['binance_oi'] = self.binance_oi
         signals['oi_source'] = self.binance_oi_source
         signals['cvd'] = self.math_engine.cvd
