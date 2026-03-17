@@ -270,8 +270,8 @@ class DataIngestion:
                             if side and last_size:
                                 self.math_engine.update_cvd(side, last_size)
 
-                            now = int(time.time())
-                            candle_start = now // 60 * 60
+                            now_float = time.time()
+                            candle_start = int(now_float) // 60 * 60
                             if mock_candle["open"] == 0.0:
                                 mock_candle["open"] = price
                             mock_candle["high"] = max(mock_candle["high"], price)
@@ -296,9 +296,12 @@ class DataIngestion:
                             self.ui_display.update_price_only(price, ts=reception_ts)
                             
                             # Throttled Signal update (Heavy math - 5 times per second max)
-                            if (now - self._last_push_time) > 0.2:
-                                self._push_signals(ts=reception_ts)
-                                self._last_push_time = now
+                            if (now_float - self._last_push_time) >= 0.2:
+                                try:
+                                    self._push_signals(ts=reception_ts)
+                                except Exception as push_err:
+                                    self.ui_display.log_error(f"Signal Push Error: {push_err}")
+                                self._last_push_time = now_float
             except Exception as e:
                 self.ui_display.log_error(f"Coinbase WS Error: {e}")
             

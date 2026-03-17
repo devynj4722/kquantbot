@@ -27,13 +27,20 @@ class MathEngine:
             self.klines.pop(0)
 
     def _close_series(self) -> pd.Series:
-        return pd.DataFrame(self.klines)['close']
+        if not self.klines:
+            return pd.Series(dtype=float)
+        df = pd.DataFrame(self.klines)
+        if 'close' not in df.columns:
+            return pd.Series(dtype=float)
+        return df['close']
 
     # ── ATR ───────────────────────────────────────────────────────────────────
     def calculate_atr(self) -> float:
         if len(self.klines) < ATR_PERIODS + 1:
             return 0.0
         df = pd.DataFrame(self.klines)
+        if 'close' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
+            return 0.0
         df['prev_close'] = df['close'].shift(1)
         df['tr'] = df[['high', 'prev_close']].max(axis=1) - df[['low', 'prev_close']].min(axis=1)
         atr = df['tr'].rolling(window=ATR_PERIODS).mean().iloc[-1]
@@ -59,6 +66,8 @@ class MathEngine:
             return 0.0
 
         df = pd.DataFrame(self.klines)
+        if 'close' not in df.columns or 'high' not in df.columns or 'low' not in df.columns:
+            return 0.0
         closes = df['close']
         df['prev_close'] = closes.shift(1)
         df['tr'] = (df[['high', 'prev_close']].max(axis=1)
