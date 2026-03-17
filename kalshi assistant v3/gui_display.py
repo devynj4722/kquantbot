@@ -433,14 +433,14 @@ class GUIDisplay:
         """Cross-platform, non-blocking institutional alert."""
         def play():
             try:
-                if platform.system() == "Windows":
+                sys_platform = platform.system()
+                if sys_platform == "Windows":
                     import winsound
                     winsound.Beep(1500, 100)
                     winsound.Beep(1800, 150)
-                else:
-                    # Mac
-                    os.system('afplay /System/Library/Sounds/Tink.aiff')
-                    os.system('afplay /System/Library/Sounds/Tink.aiff')
+                elif sys_platform == "Darwin": # Mac
+                    subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"])
+                    subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"])
             except:
                 pass
         
