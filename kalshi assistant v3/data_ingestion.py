@@ -76,9 +76,24 @@ class DataIngestion:
     async def _get_active_15m_ticker(self) -> tuple:
         session = await self.trade_executor.get_session()
         try:
-            async with session.get(f"{KALSHI_REST_URL}/markets",
-                                   params={"limit": 1, "series_ticker": KALSHI_SERIES, "status": "open"},
+            path = "/trade-api/v2/markets"
+            params = {"limit": 1, "series_ticker": KALSHI_SERIES, "status": "open"}
+            # Force signed headers for EVERYTHING on Demo
+            headers = self._make_kalshi_headers()
+            async with session.get(f"{KALSHI_REST_URL}{path}",
+                                   params=params, headers=headers,
                                    timeout=10) as r:
+                if r.status == 429:
+                    self.ui_display.log_error("KALSHI RATE LIMIT (429) — Cooling down for 120s...")
+                    await asyncio.sleep(120)
+                    return None, None
+                
+                if "application/json" not in r.headers.get("Content-Type", ""):
+                    text = await r.text()
+                    header_str = str(r.headers)
+                    self.ui_display.log_error(f"Kalshi Blocked (HTML Response). Headers: {header_str[:100]}")
+                    return None, None
+
                 data = await r.json()
                 markets = data.get("markets", [])
                 if markets:
@@ -92,18 +107,40 @@ class DataIngestion:
                     self.ui_display.log_info(
                         f"Market: {ticker} | Strike: ${self.strike_price:,.2f} (closes in {closes_in}s)")
                     return ticker, close_ts
-                self.ui_display.log_error("No open 15m markets found.")
+                
+                # DIAGNOSTIC: Search BROADLY for any open market
+                diag_path = "/trade-api/v2/markets"
+                async with session.get(f"{KALSHI_REST_URL}{diag_path}",
+                                       params={"limit": 5, "status": "open"},
+                                       headers=headers,
+                                       timeout=10) as r2:
+                    if r2.status == 200:
+                        if "application/json" not in r2.headers.get("Content-Type", ""):
+                            text = await r2.text()
+                            self.ui_display.log_error(f"Demo Diag Blocked (HTML): {text[:100]}")
+                        else:
+                            diag_data = await r2.json()
+                            diag_markets = diag_data.get("markets", [])
+                            if diag_markets:
+                                tickers = [m["ticker"] for m in diag_markets]
+                                self.ui_display.log_error(f"KXBTC15M not found. Try one of these: {', '.join(tickers[:3])}")
+                            else:
+                                self.ui_display.log_error("CRITICAL: Zero open markets returned on Demo API.")
+                    else:
+                        self.ui_display.log_error(f"Diag fetch failed: HTTP {r2.status}")
                 return None, None
         except Exception as e:
             self.ui_display.log_error(f"REST error: {e}")
             return None, None
 
-    def _make_kalshi_headers(self) -> dict:
+    def _make_kalshi_headers(self, method: str = "GET", path: str = "/trade-api/v2/markets") -> dict:
         if not (self.kalshi_private_key and KALSHI_API_KEY):
             return {}
         ts = int(time.time() * 1000)
+        # Signature msg must be: {timestamp}{method}{path}
+        msg = f"{ts}{method}{path}"
         sig = self.kalshi_private_key.sign(
-            f"{ts}GET/trade-api/ws/v2".encode(),
+            msg.encode(),
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256()
         )
@@ -323,8 +360,8 @@ class DataIngestion:
             self.ui_display.log_info("Checking for active Kalshi markets...")
             ticker, close_ts = await self._get_active_15m_ticker()
             if not ticker:
-                self.ui_display.log_error("No active Kalshi markets. Retrying in 30s...")
-                await asyncio.sleep(30)
+                self.ui_display.log_error("No active Kalshi markets. Retrying in 60s...")
+                await asyncio.sleep(60)
                 continue
 
             self.current_ticker = ticker
@@ -332,9 +369,13 @@ class DataIngestion:
 
             self.ui_display.log_info(f"Connecting to Kalshi WS for {ticker}...")
             try:
-                headers = self._make_kalshi_headers()
+                # Sign specifically for the WS path
+                ws_path = "/trade-api/ws/v2"
+                headers = self._make_kalshi_headers(method="GET", path=ws_path)
+                # Ensure the URL is correctly formed from the base
+                ws_url = f"{KALSHI_WS_URL}{ws_path}"
                 async with websockets.connect(
-                    KALSHI_WS_URL, 
+                    ws_url, 
                     additional_headers=headers, 
                     ssl=self.ssl_context,
                     ping_interval=20,
@@ -346,6 +387,10 @@ class DataIngestion:
                         self.ui_display.log_error(
                             "AUTH FAILED (401/403) — Kalshi API key may be expired. Check .env.")
                         await asyncio.sleep(60)
+                        continue
+                    elif ws.response.status_code != 101:
+                        self.ui_display.log_error(f"Kalshi WS Reject: {ws.response.status_code}")
+                        await asyncio.sleep(10)
                         continue
 
                     await ws.send(json.dumps({

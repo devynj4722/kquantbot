@@ -199,17 +199,18 @@ class GUIDisplay:
         label = "PIN Always on Top: ON" if self._on_top else "PIN Always on Top: OFF"
         dpg.configure_item("on_top_btn", label=label)
 
-    def _show_insight_popup(self, anomaly: dict):
+    def _show_insight_popup(self, anomaly: dict, title: str = "INSTITUTIONAL ALERT"):
         if dpg.does_item_exist("alert_popup"):
-            return
+            dpg.delete_item("alert_popup") # Force refresh if new one comes in
 
-        with dpg.window(label="INSTITUTIONAL ALERT", modal=True, show=True, 
-                        tag="alert_popup", width=350, height=180, pos=[50, 200], no_resize=True):
-            dpg.add_text(anomaly['alert'], color=(255, 68, 68))
+        with dpg.window(label=title, modal=True, show=True, 
+                        tag="alert_popup", width=350, height=200, pos=[50, 250], no_resize=True):
+            color = (0, 255, 170) if "PRIME" in title else (255, 68, 68)
+            dpg.add_text(anomaly['alert'], color=color)
             dpg.add_separator()
             dpg.add_spacer(height=5)
             dpg.add_text(anomaly['explanation'], wrap=330)
-            dpg.add_spacer(height=10)
+            dpg.add_spacer(height=15)
             dpg.add_button(label="ACKNOWLEDGE", width=120, callback=lambda: dpg.delete_item("alert_popup"))
 
     def _show_help(self):
@@ -315,12 +316,19 @@ class GUIDisplay:
         dpg.set_value("rsi_val", f"{rsi:.1f}")
         dpg.set_value("ev_val", f"{ev:+.4f}")
         dpg.set_value("dir_val", direction)
-        dpg.set_value("strike_val", f"${strike:,.2f}")
+        
+        # Defensive display for Strike and ATR Dist
+        if strike > 0:
+            dpg.set_value("strike_val", f"${strike:,.2f}")
+            dpg.set_value("atr_dist_val", f"{atr_dist:+.2f}")
+        else:
+            dpg.set_value("strike_val", "---")
+            dpg.set_value("atr_dist_val", "---")
+            
         dpg.set_value("zscore_val", f"{z_score:,.2f}")
         dpg.set_value("macd_val", f"{hist:+.4f}")
         dpg.set_value("prob_val", f"{prob:.0%}")
         dpg.set_value("trend_val", trend)
-        dpg.set_value("atr_dist_val", f"{atr_dist:+.2f}")
         dpg.set_value("oi_val", f"{oi:,.0f} ({oi_source})")
         dpg.set_value("cvd_val", f"{cvd:+.1f} BTC")
 
@@ -386,34 +394,48 @@ class GUIDisplay:
         dpg.set_value("insight_text", "\n".join(insight_lines))
         dpg.configure_item("insight_text", color=(200, 200, 200))
 
-        # Walls - Format matching screenshot
+        # Walls - Format matching YES/NO payoff
         supports = signals.get('supports', [])[:5]
         resistances = signals.get('resistances', [])[:5]
-        walls_str = ""
-        for p, v in resistances:
-            walls_str += f"RESIST  {p:.2f}   |   ${v:,.0f}\n"
-        walls_str += "__________________________________________\n\n"
-        for p, v in supports:
-            walls_str += f"SUPPORT {round(1.0-p, 2):.2f}   |   ${v:,.0f}\n"
+        
+        if not supports and not resistances:
+            walls_str = "Monitoring orderbook... No major walls detected."
+        else:
+            walls_str = ""
+            for p, v in resistances:
+                # p is the price of the 'NO' contract
+                yes_p = round(1.0 - p, 2)
+                walls_str += f"RESIST  {yes_p:.2f} (YES) | {v:,.0f} contracts\n"
+            
+            walls_str += "__________________________________________\n\n"
+            
+            for p, v in supports:
+                # p is the price of the 'NO' contract
+                yes_p = round(1.0 - p, 2)
+                walls_str += f"SUPPORT {yes_p:.2f} (YES) | {v:,.0f} contracts\n"
+        
         dpg.set_value("walls_text", walls_str)
 
         # Signal banner
         is_prime = signals.get('is_good_setup', False)
+        conviction = signals.get('conviction', 0)
         if is_prime:
-            dpg.set_value("signal_label", "PRIME SETUP - ACT NOW")
+            dpg.set_value("signal_label", f"SMART SETUP DETECTED ({conviction}%)")
             dpg.configure_item("signal_label", color=(0, 255, 170))
             bet = "YES" if direction == "UP" else "NO"
-            explain = (f"Prime Setup Detected:\n"
-                       f"* BTC momentum ({direction}) indicates edge.\n"
+            explain = (f"High-Conviction Smart Setup ({conviction}%):\n"
+                       f"* Momentum ({direction}) + CVD ({'Bullish' if signals.get('cvd',0)>0 else 'Bearish'}) Alignment.\n"
                        f"* Expected Value: {ev:+.3f}\n"
                        f"* Recommendation: Place {bet} order.")
             dpg.set_value("edge_req", explain)
             if not self._last_prime:
+                self._show_insight_popup({"alert": "SMART TRADE SIGNAL", "explanation": explain}, title="ALGORITHMIC TRADE DETECTED")
                 self._alert_sound()
+                self._last_alert_time = time.time()
         else:
-            dpg.set_value("signal_label", "Monitoring... Wait for edge.")
+            dpg.set_value("signal_label", f"Monitoring... (Conviction: {conviction}%)")
             dpg.configure_item("signal_label", color=(150, 150, 150))
-            dpg.set_value("edge_req", "Waiting for statistical edge. Prime Setup requires:\n * Z-Score >= 2.0 -- BTC 2s from 15m mean\n * EV > 0 -- momentum model beats market odds\n * 2-of-3 consensus vote (RSI, MACD, Z-Score)")
+            dpg.set_value("edge_req", "Waiting for Signal Fusion (Conviction > 80%). Requires:\n * Z-Score >= 2.0 -- BTC volatility peak\n * Momentum + CVD Alignment -- Aggressive Flow backing Price\n * 2-of-3 Consensus (RSI, MACD, Z-Score)")
         
         self._last_prime = is_prime
 

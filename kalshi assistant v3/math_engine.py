@@ -132,15 +132,16 @@ class MathEngine:
         """
         Votes across RSI, MACD, and Z-Score to produce UP / DOWN / NEUTRAL.
         Requires 2-of-3 agreement.
+        Sensitized to (45/55) RSI and (1.0) Z-Score for higher reactivity.
         """
         votes_up = 0
         votes_down = 0
 
-        # RSI: <40 → bullish reversal, >60 → bearish reversal
+        # RSI: <45 → bullish reversal bias, >55 → bearish reversal bias
         if rsi > 0:
-            if rsi < 40:
+            if rsi < 45:
                 votes_up += 1
-            elif rsi > 60:
+            elif rsi > 55:
                 votes_down += 1
 
         # MACD: positive histogram → upward momentum
@@ -150,9 +151,10 @@ class MathEngine:
             votes_down += 1
 
         # Z-Score: negative (below mean) → mean-reversion up
-        if z_score < -1.5:
+        if z_score < -1.0:
             votes_up += 1
-        elif z_score > 1.5:
+        elif z_score > 1.0:
+            votes_down += 1
             votes_down += 1
 
         if votes_up >= 2:
@@ -309,10 +311,27 @@ class MathEngine:
         signal_direction = self.get_signal_direction(rsi, macd, z_score)
         supports, resistances = self.get_support_resistance_walls()
 
+        # Signal Fusion (Smart Logic)
+        # 1. Base Confluence: Direction must match CVD bias
+        # If UP, CVD should be positive (Net Takers Buying)
+        # If DOWN, CVD should be negative (Net Takers Selling)
+        cvd_bias = "UP" if self.cvd > 0 else "DOWN"
+        
+        conviction_score = 0
+        if signal_direction != "NEUTRAL":
+            conviction_score += 40 # Base for having a direction
+            if signal_direction == cvd_bias:
+                conviction_score += 40 # Confluence Bonus!
+            
+            # Additional bonus for MACD agreement
+            if (signal_direction == "UP" and macd['histogram'] > 0) or \
+               (signal_direction == "DOWN" and macd['histogram'] < 0):
+                conviction_score += 20
+
         is_good_setup = (
+            conviction_score >= 80 and
             abs(z_score) >= Z_SCORE_THRESHOLD and
-            ev > EV_THRESHOLD and
-            signal_direction != "NEUTRAL"
+            ev > EV_THRESHOLD
         )
 
         return {
@@ -322,6 +341,7 @@ class MathEngine:
             'macd': macd,
             'cvd': self.cvd,
             'signal_direction': signal_direction,
+            'conviction': conviction_score,
             'ev': ev,
             'supports': supports,
             'resistances': resistances,

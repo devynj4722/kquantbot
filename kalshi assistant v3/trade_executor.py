@@ -25,7 +25,28 @@ class TradeExecutor:
 
     async def get_session(self):
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            import ssl
+            import certifi
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            
+            # Browser-grade headers to avoid Cloudflare/Akamai detection
+            host = KALSHI_REST_URL.split("://")[1]
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": f"{KALSHI_REST_URL}/",
+                "Origin": KALSHI_REST_URL,
+                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin"
+            }
+            self.session = aiohttp.ClientSession(connector=connector, headers=headers)
         return self.session
 
     def _sign_rest(self, method: str, path: str) -> dict:
