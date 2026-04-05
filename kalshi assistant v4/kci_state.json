@@ -1,1 +1,1 @@
-{"kci": 0.0, "tier": "SKIP", "w_sum": 0, "direction": "NEUTRAL", "k_factor": 0, "price": 68830.75, "strike": 0.0, "countdown": "T-Minus Market closes in 09:16", "timestamp": 1774570843.6137753}
+{"kci": 70.9, "tier": "CVD_DIVERGENCE", "w_sum": 70.9, "direction": "DOWN", "k_factor": false, "price": 68430.0, "edge_cents": 22.3, "strike": 0.0, "countdown": "T-Minus Market closes in 13:29", "timestamp": 1775430090.4910634}

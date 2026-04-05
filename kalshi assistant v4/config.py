@@ -16,7 +16,7 @@ KALSHI_DEMO_PRIVATE_KEY = _strip_key(os.getenv("KALSHI_DEMO_PRIVATE_KEY", ""))
 
 # Kalshi Configuration
 USE_DEMO = False           # Set to False to trade on Production (Real Money)
-DRY_RUN = True            # Set to False to ALLOW the bot to place orders on Kalshi
+DRY_RUN = False            # Set to False to ALLOW the bot to place orders on Kalshi
 
 if USE_DEMO:
     KALSHI_API_KEY = KALSHI_DEMO_API_KEY
@@ -56,7 +56,33 @@ PRICE_15M_SAMPLES = 900 # 15m / 1s
 MIN_WALL_VOLUME = 1.0   # Shows all liquidity walls (for testing/verification)
 ORDERBOOK_PRICE_BUCKET_SIZE = 0.01 # 1 cent resolution for contracts (0.01 scale)
 
+# ── Edge-Based Trading ────────────────────────────────────────────────────────
+MIN_EDGE_CENTS = 8            # Minimum edge (cents) to enter a trade
+STRONG_EDGE_CENTS = 15        # "Strong" edge for sizing up
+
+# ── Orderbook Microstructure ──────────────────────────────────────────────────
+IMBALANCE_DEPTH_CENTS = 0.03  # 3 cents on Kalshi's 0-1 scale
+IMBALANCE_STRONG = 2.5        # 2.5:1 bid/ask ratio = strong signal
+
+# ── Regime Detection ──────────────────────────────────────────────────────────
+REGIME_SQUEEZE_RATIO = 0.7    # ATR_short / ATR_long < 0.7 = squeeze
+REGIME_EXPANSION_RATIO = 1.3  # ATR_short / ATR_long > 1.3 = expansion
+
+# ── Basis Arbitrage ───────────────────────────────────────────────────────────
+BASIS_MIN_DIVERGENCE = 0.08   # 8% minimum divergence to trigger
+
+# ── Weighted Score Weights (must sum to 1.0) ──────────────────────────────────
+W_EDGE = 0.30                 # Edge signal weight
+W_MOMENTUM = 0.20             # Momentum consensus weight
+W_ORDERBOOK = 0.15            # Orderbook imbalance weight
+W_CVD = 0.15                  # CVD / flow weight
+W_BASIS = 0.10                # Basis arbitrage weight
+W_REGIME = 0.10               # Regime alignment weight
+
+# ── Composite Decision ────────────────────────────────────────────────────────
+MIN_COMPOSITE_SCORE = 55      # Minimum weighted score to enter a trade
+
 # ── Trading Settings ──────────────────────────────────────────────────────────
 # DRY_RUN is now managed at the top under Kalshi Configuration
-TRADE_SIZE_DOLLARS = 5   # Max dollars to risk per Prime Setup signal
+TRADE_SIZE_DOLLARS = 1   # Max dollars to risk per Prime Setup signal
 MAX_OPEN_POSITIONS = 3    # Don't fire more than this many unresolved signals per session

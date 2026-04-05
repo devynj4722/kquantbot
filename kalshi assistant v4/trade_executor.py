@@ -8,11 +8,16 @@ import time
 import json
 import requests
 from config import KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_REST_URL, DRY_RUN, TRADE_SIZE_DOLLARS
-import aiohttp
 import asyncio
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+# aiohttp is only needed if DRY_RUN=False (live trading)
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
 
 
 class TradeExecutor:
@@ -24,6 +29,9 @@ class TradeExecutor:
         self.session = None
 
     async def get_session(self):
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for live trading (DRY_RUN=False). Install with: pip install aiohttp")
+
         if self.session is None or self.session.closed:
             import ssl
             import certifi
@@ -64,25 +72,34 @@ class TradeExecutor:
             "Content-Type": "application/json"
         }
 
-    async def place_order(self, ticker: str, side: str, yes_price: float, kci: float = 0.0) -> dict | None:
-        # Dynamic Sizing based on KCI Tier
-        # Score 50-75: B-Tier (Half) | 75-100: A-Tier (Full)
-        active_size = TRADE_SIZE_DOLLARS
-        if 50 <= kci < 75:
-            active_size = TRADE_SIZE_DOLLARS / 2.0
-            self.ui.log_info(f"B-Tier Setup (KCI {kci:.1f}): Sizing down by 50% (${active_size:.2f})")
-        elif kci >= 75:
-            self.ui.log_info(f"A-Tier Setup (KCI {kci:.1f}): Using standard risk (${active_size:.2f})")
+    async def place_order(self, ticker: str, side: str, yes_price: float,
+                          size_dollars: float = 1.0,
+                          composite_score: float = 0.0,
+                          setup_type: str = "") -> dict | None:
+        """
+        Places a limit order on Kalshi.  Size is pre-computed by EdgeEngine.
+        Kalshi binary contracts require yes_price in range 1-99 cents.
+        """
+        # Clamp to valid Kalshi price range (1-99 cents)
+        limit_price = max(1, min(99, int(round(yes_price * 100))))
 
-        contracts = max(1, int(active_size / yes_price))
-        limit_price = int(round(yes_price * 100))
+        # Reject obviously bad prices (near 0% or 100% probability)
+        if yes_price <= 0.02 or yes_price >= 0.98:
+            self.ui.log_error(
+                f"Price sanity check failed: {yes_price:.4f} "
+                f"({limit_price}¢) — too close to 0/100. Skipping order.")
+            return None
+
+        contracts = max(1, int(size_dollars / max(yes_price, 0.01)))
 
         if DRY_RUN:
-            msg = (f"[DRY RUN] Would place {side.upper()} order: "
-                   f"{contracts} contracts @ {limit_price}¢ on {ticker} (KCI: {kci:.1f})")
+            msg = (f"[DRY RUN] {side.upper()} {contracts}x @ {limit_price}¢ on {ticker} | "
+                   f"${size_dollars:.2f} risk | Score {composite_score:.1f} | {setup_type}")
             self.ui.log_info(msg)
             return {"dry_run": True, "ticker": ticker, "side": side,
-                    "contracts": contracts, "limit_price": limit_price, "kci": kci}
+                    "contracts": contracts, "limit_price": limit_price,
+                    "size_dollars": size_dollars, "composite_score": composite_score,
+                    "setup_type": setup_type}
 
         path = "/trade-api/v2/portfolio/orders"
         headers = self._sign_rest("POST", path)

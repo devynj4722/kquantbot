@@ -4,7 +4,8 @@ import json
 import websockets
 from config import (KALSHI_WS_URL, KALSHI_REST_URL, KALSHI_SERIES,
                     COINBASE_WS_URL, COINBASE_PRODUCT_ID, COINBASE_REST_URL,
-                    KALSHI_API_KEY, KALSHI_PRIVATE_KEY, MAX_OPEN_POSITIONS)
+                    KALSHI_API_KEY, KALSHI_PRIVATE_KEY, MAX_OPEN_POSITIONS,
+                    DRY_RUN)
 import time
 import base64
 from collections import deque
@@ -12,8 +13,14 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 import trade_logger
+from edge_engine import EdgeEngine
 import ssl
 import certifi
+
+# ── websockets version compatibility ─────────────────────────────────────────
+# 'extra_headers' works across all websockets versions (8.x through 14.x+).
+# 'additional_headers' only worked in a narrow range (10.x-13.x).
+_WS_HEADERS_KW = "extra_headers"
 
 
 class DataIngestion:
@@ -39,6 +46,8 @@ class DataIngestion:
         self._cached_ticker = None        # Reuse to avoid 429
         self._cached_market_close = 0
         self._kalshi_cooldown_until = 0   # Persistent REST backoff
+        self._orderbook_ready = False     # True after first Kalshi snapshot received
+        self.edge_engine = None           # Initialized after math_engine is ready
 
         self.kalshi_private_key = None
         if KALSHI_PRIVATE_KEY:
@@ -75,6 +84,23 @@ class DataIngestion:
             self.ui_display.log_error(f"Candle seed error: {e}")
 
     # ── Kalshi helpers ────────────────────────────────────────────────────────
+    def _reset_for_next_market(self):
+        """Clear all state tied to the expiring market so the next window starts clean."""
+        self._orderbook_ready = False
+        self.best_no_ask = 0.5
+        self._no_ask_history.clear()
+        self._cached_ticker = None
+        self._cached_market_close = 0
+        self.strike_price = 0.0
+        self.current_ticker = None
+        self.market_close_ts = 0
+        self._last_trade_ticker = None   # Allow trading on the new market
+        self._open_positions = 0         # Reset position counter for new window
+        # Clear the orderbook so stale bids/asks don't carry over
+        if hasattr(self, 'math_engine') and self.math_engine:
+            self.math_engine.bids.clear()
+            self.math_engine.asks.clear()
+
     async def _get_active_15m_ticker(self) -> tuple:
         now = time.time()
         
@@ -123,8 +149,22 @@ class DataIngestion:
                             markets = [m for m in all_m if "BTC" in m.get("ticker", "") and "15M" in m.get("ticker", "")]
 
                 if markets:
+                    # Filter out markets closing within 30s — they'll
+                    # trigger the "expiring, switching" loop immediately.
+                    from datetime import datetime as _dt
+                    _cutoff = now + 30
+                    viable = [
+                        m for m in markets
+                        if _dt.fromisoformat(
+                            m["close_time"].replace("Z", "+00:00")
+                        ).timestamp() > _cutoff
+                    ]
+                    if not viable:
+                        self.ui_display.log_info(
+                            "All open markets expire within 30s. Waiting for next window...")
+                        return None, None
                     # Pick the one closing soonest (the active 15m)
-                    m = sorted(markets, key=lambda x: x["close_time"])[0]
+                    m = sorted(viable, key=lambda x: x["close_time"])[0]
                     ticker = m["ticker"]
                     from datetime import datetime
                     close_ts = datetime.fromisoformat(
@@ -182,6 +222,7 @@ class DataIngestion:
     def _process_snapshot(self, msg: dict):
         self.math_engine.bids.clear()
         self.math_engine.asks.clear()
+        self._orderbook_ready = True
         best_no = None
         # Support V1 'no_dollars_fp' or V2 'no' lists
         no_orders = msg.get("no", msg.get("no_dollars_fp", []))
@@ -230,70 +271,153 @@ class DataIngestion:
         return model_p_win, round(1.0 - yes_price, 4), yes_price
 
     def _push_signals(self, ts: float = None):
-        """Evaluate all signals and push to GUI.
-        Throttling is handled by the calling loop (0.2s gate).
-        This function only guards against an uninitialized price.
         """
-        # Guard: do not compute signals until we have a real live price
+        Master signal pipeline:
+        1. Raw indicators (MathEngine)
+        2. Edge, orderbook, regime, basis, CVD confirm, time decay (EdgeEngine)
+        3. Composite score + smart sizing
+        4. GUI update + auto-trade
+        """
         if self.current_btc_price <= 0:
             return
-        
+
+        # Lazy-init EdgeEngine (needs math_engine reference)
+        if self.edge_engine is None:
+            self.edge_engine = EdgeEngine(self.math_engine)
+
+        # ── Phase 1: Raw indicators from MathEngine ──────────────────────
         z_score = self.math_engine.calculate_z_score(self.current_btc_price)
-        p_win, pot_profit, pot_loss = self._get_ev(z_score=z_score)
-        # Compute time_left here so ATR Kill Switch can be time-adjusted
+        model_p_win, pot_profit, pot_loss = self._get_ev(z_score=z_score)
+        market_p_win = round(1.0 - self.best_no_ask, 4)
+
         m_close = getattr(self, 'market_close_ts', 0)
         time_left = max(0, int((m_close or 0) - time.time()))
+
         signals = self.math_engine.evaluate_signals(
-            self.current_btc_price, p_win_estimate=p_win,
+            self.current_btc_price, p_win_estimate=model_p_win,
             pot_profit=pot_profit, pot_loss=pot_loss,
             strike_price=getattr(self, 'strike_price', 0.0),
             time_left=time_left)
+
         signals['prob_trend'] = self._get_prob_trend()
         signals['time_left'] = time_left
-        signals['p_win_estimate'] = p_win
-
-        # atr_distance is already computed correctly inside evaluate_signals
-        # (guarded by strike_price > 0). Do NOT recalculate here with self.strike_price
-        # which defaults to 0.0 before Kalshi connects.
-        signals['strike_price'] = getattr(self, 'strike_price', 0.0)  # for UI display only
+        signals['p_win_estimate'] = model_p_win
+        signals['strike_price'] = getattr(self, 'strike_price', 0.0)
         signals['binance_oi'] = self.binance_oi
         signals['oi_source'] = self.binance_oi_source
         signals['cvd'] = self.math_engine.cvd
 
-        # Detect Market Anomalies (Fixed-interval snapshots)
         now = time.time()
         if (now - self._last_anomaly_snapshot) >= 1.0:
             self.math_engine.update_snapshots(self.current_btc_price)
             self._last_anomaly_snapshot = now
-            
         signals['anomalies'] = self.math_engine.get_active_anomalies()
 
-        self.ui_display.update_state(current_price=self.current_btc_price, signals=signals, ts=ts)
+        # ── Phase 2: Edge Engine analysis ────────────────────────────────
+        edge_data = self.edge_engine.calculate_edge(model_p_win, market_p_win)
+        imbalance = self.edge_engine.calculate_orderbook_imbalance()
+        regime = self.edge_engine.detect_regime()
+        basis = self.edge_engine.calculate_basis_signal(model_p_win, market_p_win)
+
+        # CVD Confirm/Fade (uses 15m + 60m CVD deltas)
+        anom_metrics = signals.get('anomalies', {}).get('metrics', {})
+        cvd_confirm = self.edge_engine.calculate_cvd_confirmation(
+            signals.get('signal_direction', 'NEUTRAL'),
+            anom_metrics.get('cvd_delta_15m', 0),
+            anom_metrics.get('cvd_delta_60m', 0))
+
+        # Time Decay Adjustments
+        time_decay = self.edge_engine.calculate_time_decay_adjustments(time_left, regime)
+
+        # Portfolio Hedging
+        pending_positions = trade_logger.get_pending_positions()
+        hedge = self.edge_engine.calculate_hedge_factor(pending_positions)
+
+        # ── Phase 3: Composite score ─────────────────────────────────────
+        composite = self.edge_engine.calculate_composite_score(
+            signals, edge_data, imbalance, regime, basis,
+            cvd_confirm, time_decay, hedge)
+
+        # Smart sizing
+        smart_size = self.edge_engine.calculate_smart_size(
+            edge_data['edge_cents'], signals.get('atr', 0),
+            time_left, regime, composite['composite_score'],
+            hedge_factor=composite.get('hedge_factor', 1.0))
+
+        # ── Inject new data into signals dict for GUI ────────────────────
+        signals['edge_cents'] = edge_data['edge_cents']
+        signals['edge_direction'] = edge_data['edge_direction']
+        signals['imbalance'] = imbalance
+        signals['regime'] = regime
+        signals['basis'] = basis
+        signals['cvd_confirm'] = cvd_confirm
+        signals['time_phase'] = composite.get('time_phase', 'N/A')
+        signals['composite_score'] = composite['composite_score']
+        signals['composite_components'] = composite.get('components', {})
+        signals['composite_gates'] = composite.get('gates', {})
+        signals['setup_type'] = composite.get('setup_type', 'NONE')
+        signals['should_trade'] = composite['should_trade']
+        signals['smart_size'] = smart_size
+        signals['hedge'] = hedge
+
+        # Backward compat for GUI (maps new keys to old KCI keys)
+        signals['kci'] = composite['composite_score']
+        signals['conviction'] = composite['composite_score']
+
+        self.ui_display.update_state(
+            current_price=self.current_btc_price, signals=signals, ts=ts)
         self._last_signal_time = time.time()
 
-        # Auto-trade if prime setup and under position limit
-        if (signals['is_good_setup'] and self.trade_executor and
+        # ── Phase 4: Auto-trade ──────────────────────────────────────────
+        # Orderbook is valid only if we have real data AND price is in sane range
+        orderbook_valid = (self._orderbook_ready
+                           and 0.02 < self.best_no_ask < 0.98)
+        if (composite['should_trade'] and self.trade_executor and
                 self._open_positions < MAX_OPEN_POSITIONS and
-                self.current_ticker != self._last_trade_ticker):
+                self.current_ticker != self._last_trade_ticker and
+                orderbook_valid):
             direction = signals.get('signal_direction', 'NEUTRAL')
             if direction != 'NEUTRAL':
                 side = 'yes' if direction == 'UP' else 'no'
-                # Launch trade in background task to not block math loop
+                yes_price = round(1.0 - self.best_no_ask, 4)
+                setup_type = composite.get('setup_type', 'UNKNOWN')
+
+                contracts = max(1, int(smart_size / max(yes_price, 0.01)))
+                limit_price = int(round(yes_price * 100))
+
                 asyncio.create_task(self.trade_executor.place_order(
                     ticker=self.current_ticker, side=side,
-                    yes_price=round(1.0 - self.best_no_ask, 4),
-                    kci=signals['kci']))
+                    yes_price=yes_price, size_dollars=smart_size,
+                    composite_score=composite['composite_score'],
+                    setup_type=setup_type))
+
                 trade_logger.log_signal(
                     ticker=self.current_ticker,
                     direction=direction,
                     ev=signals['ev'],
+                    edge_cents=edge_data['edge_cents'],
                     z_score=signals['z_score'],
                     rsi=signals.get('rsi', 0),
                     macd_histogram=signals.get('macd', {}).get('histogram', 0),
-                    market_p_win=round(1.0 - self.best_no_ask, 4),
-                    yes_price=round(1.0 - self.best_no_ask, 4),
-                    kci=signals['kci'],
-                    dry_run=True)  # trade_executor enforces DRY_RUN internally
+                    market_p_win=market_p_win,
+                    yes_price=yes_price,
+                    kci=signals.get('w_sum', 0),
+                    composite_score=composite['composite_score'],
+                    setup_type=setup_type,
+                    size_dollars=smart_size,
+                    dry_run=DRY_RUN)
+
+                # ── Trade Execution Alert (sound + GUI popup) ────────
+                self.ui_display.notify_trade_executed(
+                    side=side,
+                    ticker=self.current_ticker,
+                    size_dollars=smart_size,
+                    composite_score=composite['composite_score'],
+                    setup_type=setup_type,
+                    contracts=contracts,
+                    limit_price=limit_price,
+                    dry_run=DRY_RUN)
+
                 self._last_trade_ticker = self.current_ticker
                 self._open_positions += 1
 
@@ -409,25 +533,30 @@ class DataIngestion:
                 headers = self._make_kalshi_headers(method="GET", path=ws_path)
                 # Ensure the URL is correctly formed from the base
                 ws_url = f"{KALSHI_WS_URL}{ws_path}"
-                async with websockets.connect(
-                    ws_url, 
-                    additional_headers=headers, 
-                    ssl=self.ssl_context,
-                    ping_interval=20,
-                    ping_timeout=20,     # Increased from 10
-                    open_timeout=30,      # Added for slow handshakes
-                    max_size=16 * 1024 * 1024
-                ) as ws:
+                ws_kwargs = {
+                    _WS_HEADERS_KW: headers,
+                    "ssl": self.ssl_context,
+                    "ping_interval": 20,
+                    "ping_timeout": 20,
+                    "open_timeout": 30,
+                    "max_size": 16 * 1024 * 1024,
+                }
+                async with websockets.connect(ws_url, **ws_kwargs) as ws:
                     self.ui_display.log_info(f"Kalshi WS Connected ({ticker})")
-                    if ws.response.status_code in (401, 403):
-                        self.ui_display.log_error(
-                            "AUTH FAILED (401/403) — Kalshi API key may be expired. Check .env.")
-                        await asyncio.sleep(60)
-                        continue
-                    elif ws.response.status_code != 101:
-                        self.ui_display.log_error(f"Kalshi WS Reject: {ws.response.status_code}")
-                        await asyncio.sleep(10)
-                        continue
+                    # In websockets <14, ws.response has status_code.
+                    # In v14+, a non-101 handshake raises InvalidStatusCode instead.
+                    _resp = getattr(ws, "response", None)
+                    if _resp is not None:
+                        _sc = getattr(_resp, "status_code", None) or getattr(_resp, "status", None)
+                        if _sc in (401, 403):
+                            self.ui_display.log_error(
+                                "AUTH FAILED (401/403) — Kalshi API key may be expired. Check .env.")
+                            await asyncio.sleep(60)
+                            continue
+                        elif _sc is not None and _sc != 101:
+                            self.ui_display.log_error(f"Kalshi WS Reject: {_sc}")
+                            await asyncio.sleep(10)
+                            continue
 
                     await ws.send(json.dumps({
                         "id": 1, "cmd": "subscribe",
@@ -439,6 +568,14 @@ class DataIngestion:
                         time_left = close_ts - time.time()
                         if time_left <= 10:
                             self.ui_display.log_info(f"Market {ticker} expiring, switching...")
+                            # Reconcile this market's outcome after it settles
+                            asyncio.create_task(self._reconcile_market(ticker))
+                            self._reset_for_next_market()
+                            # Wait past close so the API returns the NEXT market
+                            wait_s = max(15, int(time_left) + 5)
+                            self.ui_display.log_info(
+                                f"Waiting {wait_s}s for next market window...")
+                            await asyncio.sleep(wait_s)
                             break
                         try:
                             recv_timeout = min(20, max(1, time_left - 10))
@@ -450,6 +587,9 @@ class DataIngestion:
                             elif msg_type in ("orderbook_delta", "delta"):
                                 self._process_delta(payload)
                             elif msg_type == "market_status" and payload.get("status") in ("finalized", "closed"):
+                                self.ui_display.log_info(f"Market {ticker} settled via WS status.")
+                                asyncio.create_task(self._reconcile_market(ticker))
+                                self._reset_for_next_market()
                                 break
                             if msg_type in ("orderbook_snapshot", "snapshot", "orderbook_delta", "delta"):
                                 now_float = time.time()
@@ -462,9 +602,131 @@ class DataIngestion:
                         except websockets.exceptions.ConnectionClosed:
                             self.ui_display.log_info("Kalshi WS closed. Reconnecting...")
                             break
+            except websockets.exceptions.InvalidStatusCode as e:
+                # websockets v14+ raises this instead of returning ws.response
+                code = getattr(e, "status_code", None) or getattr(e, "code", None)
+                if code in (401, 403):
+                    self.ui_display.log_error(
+                        f"AUTH FAILED ({code}) — Kalshi API key may be expired. Check .env.")
+                    await asyncio.sleep(60)
+                    continue
+                self.ui_display.log_error(f"Kalshi WS Reject ({code}): {e}")
             except Exception as e:
                 self.ui_display.log_error(f"Kalshi WS Error: {e}")
             await asyncio.sleep(2)
+
+    # ── Settlement Reconciliation ──────────────────────────────────────────────
+    async def _reconcile_market(self, ticker: str):
+        """
+        Checks the settlement result for a specific market and updates trades.csv.
+        Called when a market expires or receives a finalized status.
+        Waits 30s for settlement, then polls the REST API for the result.
+        """
+        await asyncio.sleep(30)  # Give Kalshi time to settle the market
+
+        session = await self.trade_executor.get_session()
+        try:
+            path = f"/trade-api/v2/markets/{ticker}"
+            headers = self._make_kalshi_headers(method="GET", path=path)
+
+            async with session.get(f"{KALSHI_REST_URL}{path}",
+                                   headers=headers, timeout=15) as r:
+                if r.status == 429:
+                    self.ui_display.log_error(f"Rate limited during reconciliation for {ticker}. Will retry later.")
+                    return
+                if r.status != 200:
+                    self.ui_display.log_error(f"Reconciliation REST error {r.status} for {ticker}")
+                    return
+
+                data = await r.json()
+                market = data.get("market", data)
+                result = market.get("result", "")  # "yes", "no", or ""
+                status = market.get("status", "")
+
+                if status not in ("finalized", "settled", "closed") or not result:
+                    self.ui_display.log_info(f"Market {ticker} not yet settled (status={status}). Will retry via background task.")
+                    return
+
+                # Determine outcome for our logged signals
+                pending = trade_logger.get_pending_tickers()
+                if ticker not in pending:
+                    return  # No trades on this market
+
+                # Read signals for this ticker to get direction and entry price
+                import csv  # local import to avoid circular dependency
+                with open(trade_logger.TRADES_CSV, "r", newline="") as f:
+                    rows = list(csv.DictReader(f))
+
+                for row in rows:
+                    if row.get("ticker") == ticker and row.get("outcome") == "PENDING":
+                        direction = row.get("direction", "")
+                        yes_price = float(row.get("yes_price", 0) or 0)
+
+                        # Did our signal win?
+                        # UP direction = we bought YES. Market result "yes" = WIN.
+                        # DOWN direction = we bought NO. Market result "no" = WIN.
+                        signal_won = (
+                            (direction == "UP" and result == "yes") or
+                            (direction == "DOWN" and result == "no")
+                        )
+
+                        if signal_won:
+                            # Profit = (1.0 - yes_price) per contract for YES win
+                            # or (1.0 - (1-yes_price)) = yes_price per contract for NO win
+                            if direction == "UP":
+                                pnl = round(1.0 - yes_price, 4)
+                            else:
+                                pnl = round(yes_price, 4)  # NO price = 1 - yes_price, profit = 1 - no_price = yes_price
+                            outcome = "WIN"
+                        else:
+                            if direction == "UP":
+                                pnl = round(-yes_price, 4)
+                            else:
+                                pnl = round(-(1.0 - yes_price), 4)
+                            outcome = "LOSS"
+
+                        break  # Only need to check one row for the direction
+
+                updated = trade_logger.update_outcome(ticker, outcome, pnl)
+
+                # Decrement open positions by the number of resolved trades
+                self._open_positions = max(0, self._open_positions - updated)
+
+                self.ui_display.log_info(
+                    f"RECONCILED: {ticker} → {outcome} | Market result: {result.upper()} | "
+                    f"P&L est: {pnl:+.4f}/contract | Positions open: {self._open_positions}")
+
+                # Log running performance
+                perf = trade_logger.get_performance_summary()
+                self.ui_display.log_info(
+                    f"PERFORMANCE: {perf['wins']}W / {perf['losses']}L "
+                    f"({perf['win_rate']}%) | Total P&L: ${perf['total_pnl']:+.2f} | "
+                    f"Pending: {perf['pending']}")
+
+        except Exception as e:
+            self.ui_display.log_error(f"Reconciliation error for {ticker}: {e}")
+
+    async def _reconcile_pending_task(self):
+        """
+        Background task that periodically checks for any PENDING trades
+        whose markets may have settled while the bot was offline or during
+        a missed settlement event. Runs every 5 minutes.
+        """
+        await asyncio.sleep(60)  # Initial delay — let the bot stabilize first
+
+        while True:
+            try:
+                pending_tickers = trade_logger.get_pending_tickers()
+                if pending_tickers:
+                    self.ui_display.log_info(
+                        f"Reconciliation sweep: {len(pending_tickers)} pending ticker(s) to check.")
+                    for ticker in pending_tickers:
+                        await self._reconcile_market(ticker)
+                        await asyncio.sleep(2)  # Respect rate limits between checks
+            except Exception as e:
+                self.ui_display.log_error(f"Reconciliation sweep error: {e}")
+
+            await asyncio.sleep(300)  # Every 5 minutes
 
     async def _watchdog_task(self):
         """Monitors TICKER latency and forces full stack reset if hung > 10s."""
@@ -582,6 +844,7 @@ class DataIngestion:
                     asyncio.create_task(self.connect_kalshi()),
                     asyncio.create_task(self._watchdog_task()),
                     asyncio.create_task(self._fetch_oi_task()),
+                    asyncio.create_task(self._reconcile_pending_task()),
                     seed_task
                 ]
                 

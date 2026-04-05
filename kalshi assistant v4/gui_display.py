@@ -19,6 +19,8 @@ class GUIDisplay:
         self._current_anomalies = []
         self._on_top = True
         self.is_running = True
+        self._pending_trade_alert = None
+        self._last_popup_time = 0
 
         # DPG setup is handled in run()
 
@@ -104,10 +106,10 @@ class GUIDisplay:
                         dpg.add_text("RSI:", color=(180, 180, 180))
                         dpg.add_text("EV:", color=(180, 180, 180))
                         dpg.add_text("Direction:", color=(180, 180, 180))
-                        dpg.add_text("KCI Score:", color=(0, 255, 255))
-                        dpg.add_text("KCI Tier:", color=(0, 255, 255))
-                        dpg.add_text("K-Switch (A/E/T):", color=(150, 150, 150))
-                    
+                        dpg.add_text("Composite:", color=(0, 255, 255))
+                        dpg.add_text("Setup:", color=(0, 255, 255))
+                        dpg.add_text("Gates (E/T/A/O/C):", color=(150, 150, 150))
+
                     # Column 2 (Values)
                     with dpg.group(width=100):
                         dpg.add_text("---", tag="atr_val")
@@ -117,31 +119,33 @@ class GUIDisplay:
                         dpg.add_text("---", tag="kci_val")
                         dpg.add_text("---", tag="tier_val")
                         dpg.add_text("---", tag="kswitches_val")
-                        
+
                     # Column 3
                     with dpg.group(width=110):
                         dpg.add_text("VC Z-Score:", color=(180, 180, 180))
                         dpg.add_text("MACD Hist:", color=(180, 180, 180))
-                        dpg.add_text("YES Prob:", color=(180, 180, 180))
+                        dpg.add_text("Edge:", color=(0, 255, 255))
                         dpg.add_text("Strike:", color=(180, 180, 180))
-                        dpg.add_text("ATR Dist:", color=(180, 180, 180))
+                        dpg.add_text("ATR Dist:", color=(255, 170, 0))
+                        dpg.add_text("Regime:", color=(180, 180, 180))
                         dpg.add_text("OI (BTC):", color=(180, 180, 180))
-                        dpg.add_text("W-Score (Max 100):", color=(150, 150, 150))
-                    
+                        dpg.add_text("OB Imbalance:", color=(150, 150, 150))
+
                     # Column 4 (Values)
                     with dpg.group(width=100):
                         dpg.add_text("---", tag="zscore_val")
                         dpg.add_text("---", tag="macd_val")
-                        dpg.add_text("---", tag="prob_val")
+                        dpg.add_text("---", tag="edge_val")
                         dpg.add_text("---", tag="strike_val")
                         dpg.add_text("---", tag="atr_dist_val")
+                        dpg.add_text("---", tag="regime_val")
                         dpg.add_text("---", tag="oi_val")
-                        dpg.add_text("---", tag="w_sum_val")
+                        dpg.add_text("---", tag="imbalance_val")
 
             dpg.add_spacer(height=10)
 
             # Market Insights Section (Dynamic Analysis)
-            with dpg.child_window(height=160, border=True, tag="insight_window", no_scrollbar=True):
+            with dpg.child_window(height=190, border=True, tag="insight_window", no_scrollbar=True):
                 with dpg.group(horizontal=True):
                     dpg.add_text("Market Insights & Analysis", color=(0, 255, 255))
                     dpg.add_spacer(width=160)
@@ -199,18 +203,66 @@ class GUIDisplay:
         dpg.configure_item("on_top_btn", label=label)
 
     def _show_insight_popup(self, anomaly: dict, title: str = "INSTITUTIONAL ALERT"):
+        # Don't replace a popup that's less than 3 seconds old
         if dpg.does_item_exist("alert_popup"):
-            dpg.delete_item("alert_popup") # Force refresh if new one comes in
+            if time.time() - self._last_popup_time < 3.0:
+                return  # Let the existing popup stay visible
+            dpg.delete_item("alert_popup")
 
-        with dpg.window(label=title, modal=True, show=True, 
-                        tag="alert_popup", width=350, height=200, pos=[50, 250], no_resize=True):
-            color = (0, 255, 170) if "PRIME" in title else (255, 68, 68)
-            dpg.add_text(anomaly['alert'], color=color)
-            dpg.add_separator()
-            dpg.add_spacer(height=5)
-            dpg.add_text(anomaly['explanation'], wrap=330)
-            dpg.add_spacer(height=15)
-            dpg.add_button(label="ACKNOWLEDGE", width=120, callback=lambda: dpg.delete_item("alert_popup"))
+        try:
+            with dpg.window(label=title, modal=True, show=True,
+                            tag="alert_popup", width=350, height=200, pos=[50, 250], no_resize=True):
+                color = (0, 255, 170) if "PRIME" in title else (255, 68, 68)
+                dpg.add_text(anomaly['alert'], color=color)
+                dpg.add_separator()
+                dpg.add_spacer(height=5)
+                dpg.add_text(anomaly['explanation'], wrap=330)
+                dpg.add_spacer(height=15)
+                dpg.add_button(label="ACKNOWLEDGE", width=120, callback=lambda: dpg.delete_item("alert_popup"))
+            self._last_popup_time = time.time()
+        except Exception:
+            pass  # DPG tag collision — don't crash the render loop
+
+    def _show_trade_popup(self, alert: dict):
+        """Large, high-visibility popup when a position is taken."""
+        tag = "trade_exec_popup"
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+        # Also dismiss any edge-detection popup so they don't stack
+        if dpg.does_item_exist("alert_popup"):
+            dpg.delete_item("alert_popup")
+
+        mode = "DRY RUN" if alert["dry_run"] else "LIVE ORDER"
+        side = alert["side"]
+        side_color = (0, 255, 170) if side == "YES" else (255, 85, 85)
+        header_color = (255, 200, 50)  # Gold for trade alerts
+
+        try:
+            with dpg.window(label=f"TRADE EXECUTED — {mode}", modal=True, show=True,
+                            tag=tag, width=420, height=280, pos=[30, 180],
+                            no_resize=True, no_collapse=True):
+                # Big header
+                dpg.add_text(f"POSITION TAKEN", color=header_color)
+                dpg.add_text(f"{mode}", color=(180, 180, 180))
+                dpg.add_separator()
+                dpg.add_spacer(height=5)
+
+                # Trade details
+                dpg.add_text(f"Side:      {side}", color=side_color)
+                dpg.add_text(f"Ticker:    {alert['ticker']}")
+                dpg.add_text(
+                    f"Size:      ${alert['size_dollars']:.2f}  "
+                    f"({alert['contracts']}x @ {alert['limit_price']}¢)")
+                dpg.add_text(f"Score:     {alert['composite_score']:.1f}")
+                dpg.add_text(f"Setup:     {alert['setup_type']}", color=(0, 200, 255))
+                dpg.add_spacer(height=10)
+                dpg.add_separator()
+                dpg.add_spacer(height=8)
+                dpg.add_button(label="OK", width=380,
+                               callback=lambda: dpg.delete_item(tag))
+            self._last_popup_time = time.time()
+        except Exception:
+            pass  # DPG tag collision — don't crash the render loop
 
     def _show_help(self):
         if dpg.does_item_exist("help_window"):
@@ -265,6 +317,12 @@ class GUIDisplay:
             self._pending_price = None
             logs = list(self._pending_logs)
             self._pending_logs.clear()
+            trade_alert = self._pending_trade_alert
+            self._pending_trade_alert = None
+
+        # ── Trade Execution Popup ────────────────────────────────────────
+        if trade_alert:
+            self._show_trade_popup(trade_alert)
 
         # Update Live Latency Indicator on every frame
         if self._ticker_ts > 0:
@@ -324,73 +382,101 @@ class GUIDisplay:
         dpg.set_value("rsi_val", f"{rsi:.1f}")
         dpg.set_value("ev_val", f"{ev:+.4f}")
         dpg.set_value("dir_val", direction)
-        
-        # Defensive display for Strike and ATR Dist
+
+        # Strike
         if strike > 0:
             dpg.set_value("strike_val", f"${strike:,.2f}")
-            dpg.set_value("atr_dist_val", f"{atr_dist:+.2f}")
         else:
             dpg.set_value("strike_val", "---")
-            dpg.set_value("atr_dist_val", "---")
-            
+
         dpg.set_value("zscore_val", f"{z_score:,.2f}")
         dpg.set_value("macd_val", f"{hist:+.4f}")
-        dpg.set_value("prob_val", f"{prob:.0%}")
+
+        # Edge (cents) — new primary metric
+        edge_cents = signals.get('edge_cents', 0.0)
+        edge_dir = signals.get('edge_direction', 'FAIR')
+        dpg.set_value("edge_val", f"{edge_cents:.1f}¢ ({edge_dir[:3]})")
+        edge_color = (0, 255, 170) if edge_cents >= 15 else ((255, 170, 0) if edge_cents >= 8 else (150, 150, 150))
+        dpg.configure_item("edge_val", color=edge_color)
+
+        # ATR Distance (from strike in ATR units) — gate: must be < 2.0 (or 1.0 in last 5min)
+        from config import ATR_DIST_KILL_SWITCH
+        time_left = signals.get('time_left', 900)
+        atr_limit = ATR_DIST_KILL_SWITCH if time_left > 300 else 1.0
+        atr_dist_abs = abs(atr_dist)
+        atr_pass = atr_dist_abs < atr_limit if strike > 0 else True
+        above_below = "above" if atr_dist > 0 else "below"
+        dpg.set_value("atr_dist_val", f"{atr_dist_abs:.2f} ({above_below}) / {atr_limit:.1f}")
+        if not atr_pass:
+            dpg.configure_item("atr_dist_val", color=(255, 68, 68))
+        elif atr_dist_abs > atr_limit * 0.7:
+            dpg.configure_item("atr_dist_val", color=(255, 170, 0))
+        else:
+            dpg.configure_item("atr_dist_val", color=(0, 255, 170))
+
+        # Regime
+        regime_data = signals.get('regime', {})
+        regime_str = regime_data.get('regime', '---')
+        regime_strat = regime_data.get('strategy', '')
+        phase = signals.get('time_phase', '')
+        dpg.set_value("regime_val", f"{regime_str} ({phase})")
+        regime_color = {
+            "TRENDING": (0, 204, 136), "EXPANSION": (0, 255, 255),
+            "SQUEEZE": (255, 170, 0), "CHOPPY": (255, 68, 68)
+        }.get(regime_str, (150, 150, 150))
+        dpg.configure_item("regime_val", color=regime_color)
+
+        # OI
         oi_pct = signals.get('anomalies', {}).get('metrics', {}).get('oi_pct_15m', 0.0)
         dpg.set_value("oi_val", f"{oi:,.0f} ({oi_pct:+.1%}) ({oi_source})")
 
-        # KCI Logic (Now uses Potency Score from MathEngine)
-        kci = signals.get('kci', 0.0)
-        dpg.set_value("kci_val", f"{kci:.1f}")
-        
-        # Kill Switches (Status)
-        ka = signals.get('k_atr', 0)
-        ke = signals.get('k_ev', 0)
-        kt = signals.get('k_time', 0)
-        k_factor = (ka and ke and kt)
+        # Orderbook Imbalance
+        imb = signals.get('imbalance', {})
+        imb_ratio = imb.get('imbalance_ratio', 1.0)
+        imb_dir = imb.get('imbalance_direction', 'NEUTRAL')
+        dpg.set_value("imbalance_val", f"{imb_ratio:.1f}:1 ({imb_dir[:3]})")
+        imb_color = (0, 255, 170) if imb_dir == "YES_PRESSURE" else ((255, 68, 68) if imb_dir == "NO_PRESSURE" else (150, 150, 150))
+        dpg.configure_item("imbalance_val", color=imb_color)
 
-        tier = "SKIP"
-        if kci >= 50 and not k_factor:
-            if not kt: tier = "TIME FILTER"
-            elif not ke: tier = "RISK FILTER"
-            elif not ka: tier = "RANGE FILTER"
-            else: tier = "FILTERED"
-        elif kci >= 75: tier = "A-TIER"
-        elif kci >= 50: tier = "B-TIER"
-        dpg.set_value("tier_val", tier)
+        # Composite Score (replaces KCI)
+        composite = signals.get('composite_score', 0.0)
+        dpg.set_value("kci_val", f"{composite:.1f}")
 
-        # Alignment/Colors
-        kci_color = (150, 150, 150)
-        if tier == "A-TIER": kci_color = (0, 255, 170)
-        elif tier == "B-TIER": kci_color = (255, 170, 0)
-        elif "FILTER" in tier: kci_color = (255, 100, 255) # Purple for filtered
-        elif kci > 0: kci_color = (255, 68, 68)
-        
-        dpg.configure_item("kci_val", color=kci_color)
-        dpg.configure_item("tier_val", color=kci_color)
+        # Setup type (replaces tier)
+        setup_type = signals.get('setup_type', 'NONE')
+        dpg.set_value("tier_val", setup_type)
 
-        # K-Switches (ATR, EV, Timing)
-        ka = signals.get('k_atr', 0)
-        ke = signals.get('k_ev', 0)
-        kt = signals.get('k_time', 0)
-        k_str = f"{'OK' if ka else 'NO'} / {'OK' if ke else 'NO'} / {'OK' if kt else 'NO'}"
-        dpg.set_value("kswitches_val", k_str)
-        dpg.configure_item("kswitches_val", color=(0, 255, 0) if (ka and ke and kt) else (255, 100, 100))
-        
-        # W-Score (Potential)
-        w_sum = signals.get('w_sum', 0.0)
-        dpg.set_value("w_sum_val", f"{w_sum:.0f}/100")
+        # Composite colors
+        comp_color = (150, 150, 150)
+        if composite >= 70: comp_color = (0, 255, 170)
+        elif composite >= 55: comp_color = (255, 170, 0)
+        elif composite > 0: comp_color = (255, 68, 68)
+        dpg.configure_item("kci_val", color=comp_color)
+        dpg.configure_item("tier_val", color=comp_color)
 
-        # Broadcast state for separate widgets
+        # Gates (Edge / Time / ATR / Orderbook / CVD-fade)
+        gates = signals.get('composite_gates', {})
+        ge = gates.get('edge_pass', False)
+        gt = gates.get('time_pass', False)
+        ga = gates.get('atr_pass', False)
+        go = gates.get('ob_pass', False)
+        gc = gates.get('cvd_pass', True)
+        g_str = f"{'OK' if ge else 'NO'} / {'OK' if gt else 'NO'} / {'OK' if ga else 'NO'} / {'OK' if go else 'NO'} / {'OK' if gc else 'NO'}"
+        all_pass = gates.get('all_pass', False)
+        dpg.set_value("kswitches_val", g_str)
+        dpg.configure_item("kswitches_val", color=(0, 255, 0) if all_pass else (255, 100, 100))
+
+        # Broadcast state for separate KCI widget
         try:
             import json
             state = {
-                "kci": kci,
-                "tier": tier,
-                "w_sum": w_sum,
+                "kci": composite,
+                "tier": setup_type,
+                "w_sum": composite,
                 "direction": signals.get('signal_direction', 'NEUTRAL'),
-                "k_factor": k_factor,
+                "k_factor": all_pass,
                 "price": current_price,
+                "edge_cents": edge_cents,
                 "strike": signals.get("strike", 0.0),
                 "countdown": dpg.get_value("countdown_label"),
                 "timestamp": time.time()
@@ -403,13 +489,12 @@ class GUIDisplay:
         z_color = (255, 68, 68) if abs(z_score) >= Z_SCORE_THRESHOLD else (255, 255, 255)
         rsi_color = (255, 68, 68) if rsi > 70 else ((0, 204, 136) if rsi < 30 else (255, 255, 255))
         dir_color = (0, 255, 170) if direction == "UP" else ((255, 68, 68) if direction == "DOWN" else (128, 128, 128))
-        
+
         dpg.configure_item("zscore_val", color=z_color)
         dpg.configure_item("rsi_val", color=rsi_color)
         dpg.configure_item("dir_val", color=dir_color)
         dpg.configure_item("ev_val", color=(0, 204, 136) if ev > 0 else (255, 255, 255))
         dpg.configure_item("macd_val", color=(0, 204, 136) if hist > 0 else (255, 68, 68))
-        dpg.configure_item("atr_dist_val", color=(255, 68, 68) if abs(atr_dist) >= 2.0 else (0, 204, 136))
         dpg.configure_item("oi_val", color=(0, 255, 255))
 
         # Market Insights (Tiered CVD/Price)
@@ -426,12 +511,28 @@ class GUIDisplay:
         stat15 = f"{i15/60:.1f}m"
         stat60 = f"{i60/60:.1f}m"
 
+        # ── Live Indicator Summary ────────────────────────────────────
+        _comps = signals.get('composite_components', {})
+        _gates = signals.get('composite_gates', {})
+        _regime_str = signals.get('regime', {}).get('regime', '---')
+        _phase = signals.get('time_phase', '?')
+        _cvd_v = signals.get('cvd_confirm', {}).get('cvd_verdict', '?')
+        _edge_d = signals.get('edge_direction', 'FAIR')
+        _ob_dir = signals.get('imbalance', {}).get('imbalance_direction', '?')
+
+        def _g(k):
+            return "+" if _gates.get(k, False) else "-"
+
         insight_lines = [
-            f"15m Context ({stat15}): Price ${p15:+.1f} | CVD {c15:+.1f} BTC",
-            f"60m Context ({stat60}): Price ${p60:+.1f} | CVD {c60:+.1f} BTC",
-            "",
-            "CVD GUIDE: Cumulative Volume Delta represents 'Market Aggression'."
-            "Positive = Takers buying (Aggressive Bully). Negative = Takers selling (Aggressive Dump)."
+            f"Edge: {edge_cents:.1f}¢ ({_edge_d}) | Score: {composite:.0f}/100 | Regime: {_regime_str} ({_phase})",
+            f"Components: E:{_comps.get('edge',0):.0f} M:{_comps.get('momentum',0):.0f} "
+            f"OB:{_comps.get('orderbook',0):.0f} CVD:{_comps.get('cvd',0):.0f} "
+            f"Bas:{_comps.get('basis',0):.0f} Reg:{_comps.get('regime',0):.0f}",
+            f"Gates: E({_g('edge_pass')}) T({_g('time_pass')}) A({_g('atr_pass')}) "
+            f"OB({_g('ob_pass')}) CVD({_g('cvd_pass')}) F({_g('final_min_pass')}) "
+            f"| CVD: {_cvd_v} | OB: {_ob_dir}",
+            f"15m: Price ${p15:+.1f} | CVD {c15:+.1f} BTC   "
+            f"60m: Price ${p60:+.1f} | CVD {c60:+.1f} BTC",
         ]
         
         active_alerts = anomaly_data.get('alerts', [])
@@ -481,28 +582,50 @@ class GUIDisplay:
         
         dpg.set_value("walls_text", walls_str)
 
-        # Signal banner
-        is_prime = signals.get('is_good_setup', False)
-        conviction = signals.get('conviction', 0)
-        if is_prime:
-            dpg.set_value("signal_label", f"SMART SETUP DETECTED ({conviction}%)")
+        # Signal banner — now driven by composite score + edge engine
+        should_trade = signals.get('should_trade', False)
+        cvd_verdict = signals.get('cvd_confirm', {}).get('cvd_verdict', 'N/A')
+        smart_size = signals.get('smart_size', 1.0)
+        hedge_info = signals.get('hedge', {})
+
+        if should_trade:
+            dpg.set_value("signal_label", f"MISPRICED CONTRACT ({setup_type} | {composite:.0f})")
             dpg.configure_item("signal_label", color=(0, 255, 170))
             bet = "YES" if direction == "UP" else "NO"
-            explain = (f"High-Conviction Smart Setup ({conviction}%):\n"
-                       f"* Momentum ({direction}) + CVD ({'Bullish' if signals.get('cvd',0)>0 else 'Bearish'}) Alignment.\n"
-                       f"* Expected Value: {ev:+.3f}\n"
-                       f"* Recommendation: Place {bet} order.")
+            comps = signals.get('composite_components', {})
+            explain = (
+                f"Edge: {edge_cents:.1f}¢ | Score: {composite:.1f} | Size: ${smart_size:.2f}\n"
+                f"* Setup: {setup_type} | CVD: {cvd_verdict} | Phase: {signals.get('time_phase', '?')}\n"
+                f"* Components: E:{comps.get('edge',0):.0f} M:{comps.get('momentum',0):.0f} "
+                f"OB:{comps.get('orderbook',0):.0f} CVD:{comps.get('cvd',0):.0f} "
+                f"Bas:{comps.get('basis',0):.0f} Reg:{comps.get('regime',0):.0f}\n"
+                f"* Exposure: {hedge_info.get('net_exposure', 'FLAT')} | Action: {bet}")
             dpg.set_value("edge_req", explain)
             if not self._last_prime:
-                self._show_insight_popup({"alert": "SMART TRADE SIGNAL", "explanation": explain}, title="ALGORITHMIC TRADE DETECTED")
+                self._show_insight_popup(
+                    {"alert": f"MISPRICED: {setup_type}", "explanation": explain},
+                    title="EDGE DETECTED")
                 self._alert_sound()
                 self._last_alert_time = time.time()
         else:
-            dpg.set_value("signal_label", f"Monitoring... (Conviction: {conviction}%)")
+            dpg.set_value("signal_label", f"Scanning... (Score: {composite:.0f} | Edge: {edge_cents:.1f}¢)")
             dpg.configure_item("signal_label", color=(150, 150, 150))
-            dpg.set_value("edge_req", "Waiting for Signal Fusion (Conviction > 80%). Requires:\n * Z-Score >= 2.0 -- BTC volatility peak\n * Momentum + CVD Alignment -- Aggressive Flow backing Price\n * 2-of-3 Consensus (RSI, MACD, Z-Score)")
-        
-        self._last_prime = is_prime
+            # Show why we're not trading
+            blocked = []
+            if not gates.get('edge_pass', False): blocked.append(f"Edge < 8¢ ({edge_cents:.1f}¢)")
+            if not gates.get('time_pass', False): blocked.append("Time filter (57-05)")
+            if not gates.get('atr_pass', False):
+                _ad = abs(signals.get('atr_distance', 0))
+                _tl = signals.get('time_left', 900)
+                _al = 2.0 if _tl > 300 else 1.0
+                blocked.append(f"ATR dist {_ad:.2f} > {_al:.1f} limit")
+            if not gates.get('ob_pass', False): blocked.append("Orderbook counter-aligned")
+            if not gates.get('cvd_pass', True): blocked.append(f"CVD FADE ({cvd_verdict})")
+            if composite < 55: blocked.append(f"Score < 55 ({composite:.1f})")
+            block_str = " | ".join(blocked) if blocked else "Waiting for setup alignment"
+            dpg.set_value("edge_req", f"Blocked: {block_str}\n\nRequires:\n * Edge >= 8¢ mispricing\n * Composite Score >= 55 (6 weighted signals)\n * All gates pass (Edge/Time/ATR/OB/CVD)")
+
+        self._last_prime = should_trade
 
     def _alert_sound(self):
         def _play():
@@ -530,8 +653,72 @@ class GUIDisplay:
                     subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"])
             except:
                 pass
-        
+
         threading.Thread(target=play, daemon=True).start()
+
+    def _trade_executed_sound(self):
+        """Loud, unmistakable 3-tone alert when a position is actually taken."""
+        def play():
+            try:
+                sys_platform = platform.system()
+                if sys_platform == "Windows":
+                    import winsound
+                    # Ascending 5-tone fanfare — impossible to miss
+                    for freq, dur in [(660, 120), (880, 120), (1100, 120), (1320, 150), (1760, 300)]:
+                        winsound.Beep(freq, dur)
+                elif sys_platform == "Darwin":
+                    # Triple system sound for urgency
+                    subprocess.run(["afplay", "/System/Library/Sounds/Hero.aiff"])
+                    time.sleep(0.15)
+                    subprocess.run(["afplay", "/System/Library/Sounds/Hero.aiff"])
+                else:
+                    # Linux fallback
+                    subprocess.run(["paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"],
+                                   capture_output=True)
+            except:
+                pass
+        threading.Thread(target=play, daemon=True).start()
+
+    def notify_trade_executed(self, side: str, ticker: str, size_dollars: float,
+                              composite_score: float, setup_type: str,
+                              contracts: int = 0, limit_price: int = 0,
+                              dry_run: bool = True):
+        """
+        Called by data_ingestion when a position is taken (DRY_RUN or live).
+        Shows a prominent popup + plays the trade execution sound.
+        """
+        mode = "DRY RUN" if dry_run else "LIVE ORDER"
+        trade_msg = (
+            f"{'=' * 40}\n"
+            f"  POSITION TAKEN ({mode})\n"
+            f"{'=' * 40}\n"
+            f"  Side:     {side.upper()}\n"
+            f"  Ticker:   {ticker}\n"
+            f"  Size:     ${size_dollars:.2f} ({contracts}x @ {limit_price}¢)\n"
+            f"  Score:    {composite_score:.1f}\n"
+            f"  Setup:    {setup_type}\n"
+            f"{'=' * 40}"
+        )
+        # Log prominently to terminal
+        with self._lock:
+            self._pending_logs.append(f"\n{'*' * 50}")
+            self._pending_logs.append(f"TRADE EXECUTED: {side.upper()} ${size_dollars:.2f} on {ticker}")
+            self._pending_logs.append(f"  Score: {composite_score:.1f} | Setup: {setup_type} | {mode}")
+            self._pending_logs.append(f"{'*' * 50}\n")
+            # Queue the GUI popup + sound to run on the DPG thread
+            self._pending_trade_alert = {
+                "side": side.upper(),
+                "ticker": ticker,
+                "size_dollars": size_dollars,
+                "composite_score": composite_score,
+                "setup_type": setup_type,
+                "contracts": contracts,
+                "limit_price": limit_price,
+                "dry_run": dry_run,
+                "msg": trade_msg,
+            }
+        # Sound fires immediately from any thread
+        self._trade_executed_sound()
 
     def _update_last_trade(self):
         sig = trade_logger.get_last_signal()
