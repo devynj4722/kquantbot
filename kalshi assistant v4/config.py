@@ -16,7 +16,7 @@ KALSHI_DEMO_PRIVATE_KEY = _strip_key(os.getenv("KALSHI_DEMO_PRIVATE_KEY", ""))
 
 # Kalshi Configuration
 USE_DEMO = False           # Set to False to trade on Production (Real Money)
-DRY_RUN = False            # Set to False to ALLOW the bot to place orders on Kalshi
+DRY_RUN = True            # Set to False to ALLOW the bot to place orders on Kalshi
 
 if USE_DEMO:
     KALSHI_API_KEY = KALSHI_DEMO_API_KEY
